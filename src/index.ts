@@ -1,6 +1,14 @@
+#!/usr/bin/env node
+/**
+ * Instagram Complete MCP Server
+ * Complete Instagram automation: publish content, manage stories, analyze performance, track followers.
+ * Uses Instagram Graph API (graph.facebook.com/v18.0) and Basic Display API (graph.instagram.com).
+ */
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import express, { Request, Response } from "express";
+import express from "express";
+import fetch from "node-fetch";
 import { z } from "zod";
 
 const PORT = process.env.PORT || 8080;
@@ -8,40 +16,45 @@ const INSTAGRAM_ACCESS_TOKEN = process.env.INSTAGRAM_ACCESS_TOKEN;
 const INSTAGRAM_USER_ID = process.env.INSTAGRAM_USER_ID;
 
 const GRAPH_API = "https://graph.facebook.com/v18.0";
+const IG_API = "https://graph.instagram.com";
 
 // ── API Helpers ────────────────────────────────────────────────────────────────
 
-async function graphRequest(
-  path: string,
-  method: string = "GET",
-  body: Record<string, unknown> | null = null,
-  params: Record<string, unknown> = {}
-): Promise<Record<string, unknown>> {
+async function graphRequest(path, method = "GET", body = null, params = {}) {
   const url = new URL(`${GRAPH_API}${path}`);
-  url.searchParams.set("access_token", INSTAGRAM_ACCESS_TOKEN!);
+  url.searchParams.set("access_token", INSTAGRAM_ACCESS_TOKEN);
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
   }
 
-  const opts: RequestInit = {
+  const opts = {
     method,
     headers: { "Content-Type": "application/json" },
   };
   if (body) opts.body = JSON.stringify(body);
 
   const res = await fetch(url.toString(), opts);
-  const data = (await res.json()) as Record<string, unknown> & { error?: { message: string; code: number } };
+  const data = await res.json();
   if (data.error) throw new Error(`Instagram API error: ${data.error.message} (code ${data.error.code})`);
   return data;
 }
 
-function requireAuth(): void {
-  if (!INSTAGRAM_ACCESS_TOKEN) throw new Error("INSTAGRAM_ACCESS_TOKEN env var is required");
-  if (!INSTAGRAM_USER_ID) throw new Error("INSTAGRAM_USER_ID env var is required");
+async function igRequest(path, params = {}) {
+  const url = new URL(`${IG_API}${path}`);
+  url.searchParams.set("access_token", INSTAGRAM_ACCESS_TOKEN);
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
+  }
+
+  const res = await fetch(url.toString());
+  const data = await res.json();
+  if (data.error) throw new Error(`Instagram API error: ${data.error.message} (code ${data.error.code})`);
+  return data;
 }
 
-function jsonText(obj: unknown): { content: Array<{ type: "text"; text: string }> } {
-  return { content: [{ type: "text" as const, text: JSON.stringify(obj, null, 2) }] };
+function requireAuth() {
+  if (!INSTAGRAM_ACCESS_TOKEN) throw new Error("INSTAGRAM_ACCESS_TOKEN env var is required");
+  if (!INSTAGRAM_USER_ID) throw new Error("INSTAGRAM_USER_ID env var is required");
 }
 
 // ── MCP Server ─────────────────────────────────────────────────────────────────
@@ -55,79 +68,106 @@ const server = new McpServer({
 
 server.tool(
   "publish_photo",
-  "Publish a photo to your Instagram feed. Provide a public URL to the image and an optional caption with hashtags.",
+  "Publish a photo to your Instagram feed. Provide a public URL to the image and an optional caption. Example: publish a product photo with hashtags in the caption.",
   {
     image_url: z.string().url().describe("Public URL of the image to post (must be accessible by Instagram)"),
-    caption: z.string().max(2200).optional().describe("Post caption (max 2200 chars). Include hashtags here."),
+    caption: z.string().max(2200).optional().describe("Post caption (max 2200 chars). Include hashtags here. Example: 'New drop! #fashion #style'"),
     location_id: z.string().optional().describe("Optional Facebook location page ID to tag"),
+    user_tags: z.array(z.object({
+      username: z.string(),
+      x: z.number().min(0).max(1),
+      y: z.number().min(0).max(1),
+    })).optional().describe("Array of user tags with positions (x/y between 0-1). Example: [{username:'janedoe',x:0.5,y:0.3}]"),
   },
-  async ({ image_url, caption, location_id }) => {
+  async ({ image_url, caption, location_id, user_tags }) => {
     requireAuth();
-    const containerBody: Record<string, unknown> = { image_url, caption: caption || "", is_carousel_item: false };
+    // Step 1: Create container
+    const containerBody = { image_url, caption: caption || "", is_carousel_item: false };
     if (location_id) containerBody.location_id = location_id;
+    if (user_tags && user_tags.length > 0) containerBody.user_tags = JSON.stringify(user_tags);
 
     const container = await graphRequest(`/${INSTAGRAM_USER_ID}/media`, "POST", containerBody);
-    const result = await graphRequest(`/${INSTAGRAM_USER_ID}/media_publish`, "POST", { creation_id: container.id });
 
-    return jsonText({ success: true, media_id: result.id, message: "Photo published to Instagram feed" });
+    // Step 2: Publish
+    const result = await graphRequest(`/${INSTAGRAM_USER_ID}/media_publish`, "POST", {
+      creation_id: container.id,
+    });
+
+    return {
+      content: [{ type: "text", text: JSON.stringify({ success: true, media_id: result.id, message: "Photo published to Instagram feed" }, null, 2) }],
+    };
   }
 );
 
 server.tool(
   "publish_video",
-  "Publish a video to your Instagram feed. Provide a public URL to the video file (MP4, max 15 min).",
+  "Publish a video to your Instagram feed. Provide a public URL to the video file. Example: share a behind-the-scenes clip with a caption.",
   {
-    video_url: z.string().url().describe("Public URL of the video to post"),
+    video_url: z.string().url().describe("Public URL of the video to post (MP4, max 15 min for feed)"),
     caption: z.string().max(2200).optional().describe("Post caption with optional hashtags"),
+    thumb_offset: z.number().optional().describe("Thumbnail offset in milliseconds. Example: 3000 for 3 second mark"),
     location_id: z.string().optional().describe("Optional Facebook location page ID"),
   },
-  async ({ video_url, caption, location_id }) => {
+  async ({ video_url, caption, thumb_offset, location_id }) => {
     requireAuth();
-    const containerBody: Record<string, unknown> = { media_type: "VIDEO", video_url, caption: caption || "" };
+    const containerBody = {
+      media_type: "VIDEO",
+      video_url,
+      caption: caption || "",
+    };
+    if (thumb_offset !== undefined) containerBody.thumb_offset = thumb_offset;
     if (location_id) containerBody.location_id = location_id;
 
     const container = await graphRequest(`/${INSTAGRAM_USER_ID}/media`, "POST", containerBody);
 
+    // Poll for container status
     let status = "IN_PROGRESS";
     let attempts = 0;
     while (status === "IN_PROGRESS" && attempts < 20) {
       await new Promise(r => setTimeout(r, 5000));
       const check = await graphRequest(`/${container.id}`, "GET", null, { fields: "status_code" });
-      status = (check.status_code as string) || "IN_PROGRESS";
+      status = check.status_code || "IN_PROGRESS";
       attempts++;
     }
 
     if (status !== "FINISHED") throw new Error(`Video processing failed with status: ${status}`);
 
-    const result = await graphRequest(`/${INSTAGRAM_USER_ID}/media_publish`, "POST", { creation_id: container.id });
-    return jsonText({ success: true, media_id: result.id, message: "Video published to Instagram feed" });
+    const result = await graphRequest(`/${INSTAGRAM_USER_ID}/media_publish`, "POST", {
+      creation_id: container.id,
+    });
+
+    return {
+      content: [{ type: "text", text: JSON.stringify({ success: true, media_id: result.id, message: "Video published to Instagram feed" }, null, 2) }],
+    };
   }
 );
 
 server.tool(
   "publish_carousel",
-  "Publish a carousel post (album) with 2-10 images or videos. Great for before/after comparisons or product collections.",
+  "Publish a carousel post (album) with multiple images or videos. Great for before/after comparisons, product collections, or step-by-step tutorials.",
   {
     media_items: z.array(z.object({
       url: z.string().url().describe("Public URL of the media item"),
       type: z.enum(["IMAGE", "VIDEO"]).describe("Media type"),
-    })).min(2).max(10).describe("Array of 2-10 media items"),
+    })).min(2).max(10).describe("Array of 2-10 media items. Example: [{url:'https://...jpg',type:'IMAGE'},{url:'https://...jpg',type:'IMAGE'}]"),
     caption: z.string().max(2200).optional().describe("Caption for the carousel post"),
     location_id: z.string().optional().describe("Optional Facebook location page ID"),
   },
   async ({ media_items, caption, location_id }) => {
     requireAuth();
-    const childIds: string[] = [];
+    // Step 1: Create child containers
+    const childIds = [];
     for (const item of media_items) {
-      const body: Record<string, unknown> = { is_carousel_item: true };
+      const body = { is_carousel_item: true };
       if (item.type === "IMAGE") body.image_url = item.url;
       else { body.media_type = "VIDEO"; body.video_url = item.url; }
 
       const child = await graphRequest(`/${INSTAGRAM_USER_ID}/media`, "POST", body);
-      childIds.push(child.id as string);
+      childIds.push(child.id);
     }
 
-    const carouselBody: Record<string, unknown> = {
+    // Step 2: Create carousel container
+    const carouselBody = {
       media_type: "CAROUSEL",
       children: childIds.join(","),
       caption: caption || "",
@@ -135,44 +175,63 @@ server.tool(
     if (location_id) carouselBody.location_id = location_id;
 
     const container = await graphRequest(`/${INSTAGRAM_USER_ID}/media`, "POST", carouselBody);
-    const result = await graphRequest(`/${INSTAGRAM_USER_ID}/media_publish`, "POST", { creation_id: container.id });
 
-    return jsonText({ success: true, media_id: result.id, items_count: childIds.length, message: "Carousel published to Instagram feed" });
+    // Step 3: Publish
+    const result = await graphRequest(`/${INSTAGRAM_USER_ID}/media_publish`, "POST", {
+      creation_id: container.id,
+    });
+
+    return {
+      content: [{ type: "text", text: JSON.stringify({ success: true, media_id: result.id, items_count: childIds.length, message: "Carousel published to Instagram feed" }, null, 2) }],
+    };
   }
 );
 
 server.tool(
   "publish_story",
-  "Publish a photo or video to your Instagram Stories. Stories disappear after 24 hours.",
+  "Publish a photo or video to your Instagram Stories. Stories disappear after 24 hours and are great for time-sensitive content.",
   {
     media_url: z.string().url().describe("Public URL of the photo or video for the story"),
     media_type: z.enum(["IMAGE", "VIDEO"]).describe("Type of media: IMAGE or VIDEO"),
+    sticker_data: z.object({
+      poll_sticker: z.object({
+        question: z.string(),
+        options: z.array(z.string()).length(2),
+      }).optional(),
+    }).optional().describe("Optional interactive stickers for the story"),
   },
-  async ({ media_url, media_type }) => {
+  async ({ media_url, media_type, sticker_data }) => {
     requireAuth();
-    const body: Record<string, unknown> = { media_type: `${media_type}_STORIES` };
+    const body = { media_type: `${media_type}_STORIES` };
     if (media_type === "IMAGE") body.image_url = media_url;
     else body.video_url = media_url;
+    if (sticker_data) body.sticker_data = JSON.stringify(sticker_data);
 
     const container = await graphRequest(`/${INSTAGRAM_USER_ID}/media`, "POST", body);
-    const result = await graphRequest(`/${INSTAGRAM_USER_ID}/media_publish`, "POST", { creation_id: container.id });
 
-    return jsonText({ success: true, media_id: result.id, message: "Story published successfully" });
+    const result = await graphRequest(`/${INSTAGRAM_USER_ID}/media_publish`, "POST", {
+      creation_id: container.id,
+    });
+
+    return {
+      content: [{ type: "text", text: JSON.stringify({ success: true, media_id: result.id, message: "Story published successfully" }, null, 2) }],
+    };
   }
 );
 
 server.tool(
   "publish_reel",
-  "Publish a short-form video as an Instagram Reel (max 90 seconds). Reels are the highest-reach content format on Instagram.",
+  "Publish a short-form video as an Instagram Reel. Reels are the highest-reach content format on Instagram and can be discovered by non-followers.",
   {
     video_url: z.string().url().describe("Public URL of the video (MP4, max 90 seconds for Reels)"),
-    caption: z.string().max(2200).optional().describe("Reel caption with hashtags. Example: 'POV: You just discovered the best workflow hack #productivity'"),
+    caption: z.string().max(2200).optional().describe("Reel caption with hashtags. Example: 'POV: You just discovered the best workflow hack #productivity #tech'"),
     cover_url: z.string().url().optional().describe("Public URL for the cover image thumbnail"),
+    audio_name: z.string().optional().describe("Name of audio track to use (if applicable)"),
     share_to_feed: z.boolean().optional().default(true).describe("Whether to also share the Reel to the main feed (default: true)"),
   },
   async ({ video_url, caption, cover_url, share_to_feed }) => {
     requireAuth();
-    const body: Record<string, unknown> = {
+    const body = {
       media_type: "REELS",
       video_url,
       caption: caption || "",
@@ -182,19 +241,25 @@ server.tool(
 
     const container = await graphRequest(`/${INSTAGRAM_USER_ID}/media`, "POST", body);
 
+    // Poll for processing
     let status = "IN_PROGRESS";
     let attempts = 0;
     while (status === "IN_PROGRESS" && attempts < 24) {
       await new Promise(r => setTimeout(r, 5000));
       const check = await graphRequest(`/${container.id}`, "GET", null, { fields: "status_code" });
-      status = (check.status_code as string) || "IN_PROGRESS";
+      status = check.status_code || "IN_PROGRESS";
       attempts++;
     }
 
     if (status !== "FINISHED") throw new Error(`Reel processing failed with status: ${status}`);
 
-    const result = await graphRequest(`/${INSTAGRAM_USER_ID}/media_publish`, "POST", { creation_id: container.id });
-    return jsonText({ success: true, media_id: result.id, share_to_feed, message: "Reel published successfully" });
+    const result = await graphRequest(`/${INSTAGRAM_USER_ID}/media_publish`, "POST", {
+      creation_id: container.id,
+    });
+
+    return {
+      content: [{ type: "text", text: JSON.stringify({ success: true, media_id: result.id, share_to_feed, message: "Reel published successfully" }, null, 2) }],
+    };
   }
 );
 
@@ -202,61 +267,82 @@ server.tool(
 
 server.tool(
   "get_profile",
-  "Get your Instagram profile information including bio, follower count, media count, and account details.",
+  "Get your Instagram profile information including bio, follower count, media count, and account details. Use this to audit your profile before making changes.",
   {
     fields: z.array(z.string()).optional().default(["id", "name", "username", "biography", "followers_count", "follows_count", "media_count", "profile_picture_url", "website"]).describe("Profile fields to retrieve"),
   },
   async ({ fields }) => {
     requireAuth();
-    const data = await graphRequest(`/${INSTAGRAM_USER_ID}`, "GET", null, { fields: fields.join(",") });
-    return jsonText(data);
+    const data = await graphRequest(`/${INSTAGRAM_USER_ID}`, "GET", null, {
+      fields: fields.join(","),
+    });
+
+    return {
+      content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
+    };
   }
 );
 
 server.tool(
   "update_bio",
-  "Update your Instagram profile biography. Requires Business or Creator account. Max 150 characters.",
+  "Update your Instagram profile biography. Note: This requires a Business or Creator account with the instagram_manage_insights permission. Max 150 characters.",
   {
-    biography: z.string().max(150).describe("New bio text (max 150 characters)"),
+    biography: z.string().max(150).describe("New bio text (max 150 characters). Example: 'Digital creator. Bali-based. Sharing systems that work. 🌴'"),
   },
   async ({ biography }) => {
     requireAuth();
     const result = await graphRequest(`/${INSTAGRAM_USER_ID}`, "POST", { biography });
-    return jsonText({ success: true, updated: true, biography, result });
+    return {
+      content: [{ type: "text", text: JSON.stringify({ success: true, updated: true, biography, result }, null, 2) }],
+    };
   }
 );
 
 server.tool(
   "get_followers",
-  "Get a list of your Instagram followers with pagination. Useful for audience analysis and tracking follower growth.",
+  "Get a list of your Instagram followers. Returns paginated results with cursor-based navigation. Useful for audience analysis and tracking follower growth.",
   {
     limit: z.number().min(1).max(100).optional().default(25).describe("Number of followers to return (1-100, default 25)"),
-    after: z.string().optional().describe("Pagination cursor from previous response"),
+    after: z.string().optional().describe("Pagination cursor from previous response to get next page"),
   },
   async ({ limit, after }) => {
     requireAuth();
-    const params: Record<string, unknown> = { fields: "id,username,name,profile_picture_url", limit };
+    const params = { fields: "id,username,name,profile_picture_url", limit };
     if (after) params.after = after;
 
     const data = await graphRequest(`/${INSTAGRAM_USER_ID}/followers`, "GET", null, params);
-    return jsonText({ followers: data.data || [], count: (data.data as unknown[])?.length || 0, pagination: data.paging || null });
+
+    return {
+      content: [{ type: "text", text: JSON.stringify({
+        followers: data.data || [],
+        count: (data.data || []).length,
+        pagination: data.paging || null,
+      }, null, 2) }],
+    };
   }
 );
 
 server.tool(
   "get_following",
-  "Get a list of accounts your Instagram account is following with pagination.",
+  "Get a list of accounts your Instagram account is following. Returns paginated results. Use this to audit your following list and manage your network.",
   {
-    limit: z.number().min(1).max(100).optional().default(25).describe("Number of accounts to return"),
+    limit: z.number().min(1).max(100).optional().default(25).describe("Number of accounts to return (1-100, default 25)"),
     after: z.string().optional().describe("Pagination cursor from previous response"),
   },
   async ({ limit, after }) => {
     requireAuth();
-    const params: Record<string, unknown> = { fields: "id,username,name,profile_picture_url", limit };
+    const params = { fields: "id,username,name,profile_picture_url", limit };
     if (after) params.after = after;
 
     const data = await graphRequest(`/${INSTAGRAM_USER_ID}/follows`, "GET", null, params);
-    return jsonText({ following: data.data || [], count: (data.data as unknown[])?.length || 0, pagination: data.paging || null });
+
+    return {
+      content: [{ type: "text", text: JSON.stringify({
+        following: data.data || [],
+        count: (data.data || []).length,
+        pagination: data.paging || null,
+      }, null, 2) }],
+    };
   }
 );
 
@@ -264,9 +350,9 @@ server.tool(
 
 server.tool(
   "get_media_insights",
-  "Get performance analytics for a specific Instagram post, story, or reel. Returns impressions, reach, likes, comments, shares, saves.",
+  "Get performance analytics for a specific Instagram post, story, or reel. Returns engagement metrics like impressions, reach, likes, comments, shares, and saves.",
   {
-    media_id: z.string().describe("Instagram media ID. Get this from list_media. Example: '17854360229135492'"),
+    media_id: z.string().describe("Instagram media ID. Get this from list_media or from the publish tools. Example: '17854360229135492'"),
     metrics: z.array(z.enum([
       "impressions", "reach", "engagement", "saved", "video_views",
       "likes", "comments", "shares", "follows", "profile_visits", "replies",
@@ -275,21 +361,25 @@ server.tool(
   },
   async ({ media_id, metrics }) => {
     requireAuth();
-    const data = await graphRequest(`/${media_id}/insights`, "GET", null, { metric: metrics.join(",") });
+    const data = await graphRequest(`/${media_id}/insights`, "GET", null, {
+      metric: metrics.join(","),
+    });
 
-    const insights: Record<string, unknown> = {};
-    for (const item of ((data.data as Array<Record<string, unknown>>) || [])) {
-      const values = item.values as Array<{ value: unknown }> | undefined;
-      insights[item.name as string] = values ? values[0]?.value : item.value;
+    // Reshape into readable object
+    const insights = {};
+    for (const item of (data.data || [])) {
+      insights[item.name] = item.values ? item.values[0]?.value : item.value;
     }
 
-    return jsonText({ media_id, insights, raw: data.data });
+    return {
+      content: [{ type: "text", text: JSON.stringify({ media_id, insights, raw: data.data }, null, 2) }],
+    };
   }
 );
 
 server.tool(
   "get_profile_insights",
-  "Get account-level analytics including impressions, reach, follower count changes, and profile visits over a date range.",
+  "Get account-level analytics including impressions, reach, follower count changes, and profile visits over a date range. Essential for tracking overall account growth.",
   {
     metrics: z.array(z.enum([
       "impressions", "reach", "follower_count", "profile_views",
@@ -302,30 +392,32 @@ server.tool(
   },
   async ({ metrics, period, since, until }) => {
     requireAuth();
-    const params: Record<string, unknown> = { metric: metrics.join(","), period };
+    const params = { metric: metrics.join(","), period };
     if (since) params.since = Math.floor(new Date(since).getTime() / 1000);
     if (until) params.until = Math.floor(new Date(until).getTime() / 1000);
 
     const data = await graphRequest(`/${INSTAGRAM_USER_ID}/insights`, "GET", null, params);
 
-    const insights: Record<string, unknown> = {};
-    for (const item of ((data.data as Array<Record<string, unknown>>) || [])) {
-      insights[item.name as string] = item.values || item.value;
+    const insights = {};
+    for (const item of (data.data || [])) {
+      insights[item.name] = item.values || item.value;
     }
 
-    return jsonText({ period, insights });
+    return {
+      content: [{ type: "text", text: JSON.stringify({ period, insights }, null, 2) }],
+    };
   }
 );
 
 server.tool(
   "get_audience_demographics",
-  "Get demographic breakdown of your Instagram audience: age ranges, gender split, top countries/cities. Requires Business or Creator account.",
+  "Get demographic breakdown of your Instagram audience including age ranges, gender split, and top countries/cities. Requires Business or Creator account.",
   {
-    breakdown_type: z.enum(["age", "gender", "country", "city"]).describe("Type of demographic breakdown"),
+    breakdown_type: z.enum(["age", "gender", "country", "city"]).describe("Type of demographic breakdown. Options: age, gender, country, city"),
   },
   async ({ breakdown_type }) => {
     requireAuth();
-    const metricMap: Record<string, string> = {
+    const metricMap = {
       age: "audience_gender_age",
       gender: "audience_gender_age",
       country: "audience_country",
@@ -337,7 +429,9 @@ server.tool(
       period: "lifetime",
     });
 
-    return jsonText({ breakdown_type, demographics: data.data || [] });
+    return {
+      content: [{ type: "text", text: JSON.stringify({ breakdown_type, demographics: data.data || [] }, null, 2) }],
+    };
   }
 );
 
@@ -345,9 +439,9 @@ server.tool(
 
 server.tool(
   "search_hashtags",
-  "Search for Instagram hashtags and get their IDs. Use this before get_hashtag_media. Example: search 'balilife' to get the hashtag ID.",
+  "Search for Instagram hashtags and get their IDs. Use this to find the right hashtags before fetching media from them. Example: search for 'balilife' to find the hashtag ID.",
   {
-    hashtag: z.string().describe("Hashtag to search (without the # symbol). Example: 'balilife'"),
+    hashtag: z.string().describe("Hashtag to search (without the # symbol). Example: 'balilife' or 'entrepreneurship'"),
   },
   async ({ hashtag }) => {
     requireAuth();
@@ -356,13 +450,18 @@ server.tool(
       q: hashtag.replace(/^#/, ""),
     });
 
-    return jsonText({ hashtag: hashtag.replace(/^#/, ""), results: data.data || [] });
+    return {
+      content: [{ type: "text", text: JSON.stringify({
+        hashtag: hashtag.replace(/^#/, ""),
+        results: data.data || [],
+      }, null, 2) }],
+    };
   }
 );
 
 server.tool(
   "get_hashtag_media",
-  "Get top or recent media posts for a specific hashtag. First use search_hashtags to get the hashtag ID.",
+  "Get top or recent media posts for a specific hashtag. First use search_hashtags to get the hashtag ID, then use this tool to browse content.",
   {
     hashtag_id: z.string().describe("Hashtag ID from search_hashtags. Example: '17843825132370203'"),
     media_type: z.enum(["top_media", "recent_media"]).optional().default("top_media").describe("Whether to get top or recent posts"),
@@ -377,25 +476,27 @@ server.tool(
       limit,
     });
 
-    return jsonText({
-      hashtag_id,
-      media_type,
-      posts: data.data || [],
-      count: (data.data as unknown[])?.length || 0,
-      pagination: data.paging || null,
-    });
+    return {
+      content: [{ type: "text", text: JSON.stringify({
+        hashtag_id,
+        media_type,
+        posts: data.data || [],
+        count: (data.data || []).length,
+        pagination: data.paging || null,
+      }, null, 2) }],
+    };
   }
 );
 
 server.tool(
   "get_trending_hashtags",
-  "Compare multiple hashtags at once to find the best ones for your content strategy. Returns media count and info for each hashtag.",
+  "Get information about multiple hashtags at once to compare their reach and find the best ones for your content strategy. Returns media count and recent activity for each hashtag.",
   {
-    hashtags: z.array(z.string()).min(1).max(10).describe("List of hashtags to analyze (without # symbol). Example: ['fitness','workout','gym']"),
+    hashtags: z.array(z.string()).min(1).max(10).describe("List of hashtags to analyze (without # symbol). Example: ['fitness','workout','gym','health','wellness']"),
   },
   async ({ hashtags }) => {
     requireAuth();
-    const results: unknown[] = [];
+    const results = [];
 
     for (const tag of hashtags) {
       try {
@@ -404,20 +505,23 @@ server.tool(
           q: tag.replace(/^#/, ""),
         });
 
-        const items = searchResult.data as Array<Record<string, unknown>> | undefined;
-        if (items && items.length > 0) {
-          const tagId = items[0].id as string;
-          const info = await graphRequest(`/${tagId}`, "GET", null, { fields: "id,name,media_count" });
+        if (searchResult.data && searchResult.data.length > 0) {
+          const tagId = searchResult.data[0].id;
+          const info = await graphRequest(`/${tagId}`, "GET", null, {
+            fields: "id,name,media_count",
+          });
           results.push({ hashtag: tag, id: tagId, ...info });
         } else {
           results.push({ hashtag: tag, error: "Not found" });
         }
-      } catch (err: unknown) {
-        results.push({ hashtag: tag, error: (err as Error).message });
+      } catch (err) {
+        results.push({ hashtag: tag, error: err.message });
       }
     }
 
-    return jsonText({ hashtags: results });
+    return {
+      content: [{ type: "text", text: JSON.stringify({ hashtags: results }, null, 2) }],
+    };
   }
 );
 
@@ -425,65 +529,88 @@ server.tool(
 
 server.tool(
   "list_media",
-  "List your Instagram media posts with pagination. Returns photos, videos, carousels, and reels from your feed.",
+  "List your Instagram media posts with pagination. Returns photos, videos, carousels, and reels from your feed. Use this to audit your content or find media IDs for other operations.",
   {
     limit: z.number().min(1).max(100).optional().default(20).describe("Number of posts to return (1-100, default 20)"),
-    after: z.string().optional().describe("Pagination cursor from previous response"),
+    after: z.string().optional().describe("Pagination cursor from previous response for next page"),
     fields: z.array(z.string()).optional().default(["id", "media_type", "thumbnail_url", "media_url", "caption", "timestamp", "like_count", "comments_count", "permalink"]).describe("Fields to return for each post"),
   },
   async ({ limit, after, fields }) => {
     requireAuth();
-    const params: Record<string, unknown> = { fields: fields.join(","), limit };
+    const params = { fields: fields.join(","), limit };
     if (after) params.after = after;
 
     const data = await graphRequest(`/${INSTAGRAM_USER_ID}/media`, "GET", null, params);
-    return jsonText({ media: data.data || [], count: (data.data as unknown[])?.length || 0, pagination: data.paging || null });
+
+    return {
+      content: [{ type: "text", text: JSON.stringify({
+        media: data.data || [],
+        count: (data.data || []).length,
+        pagination: data.paging || null,
+      }, null, 2) }],
+    };
   }
 );
 
 server.tool(
   "get_media",
-  "Get detailed information about a specific Instagram post including caption, timestamp, engagement stats, and media URL.",
+  "Get detailed information about a specific Instagram post. Returns full metadata including caption, timestamp, engagement stats, and media URL.",
   {
     media_id: z.string().describe("Instagram media ID. Example: '17854360229135492'"),
     fields: z.array(z.string()).optional().default(["id", "media_type", "media_url", "thumbnail_url", "caption", "timestamp", "like_count", "comments_count", "permalink", "is_comment_enabled"]).describe("Fields to retrieve"),
   },
   async ({ media_id, fields }) => {
     requireAuth();
-    const data = await graphRequest(`/${media_id}`, "GET", null, { fields: fields.join(",") });
-    return jsonText(data);
+    const data = await graphRequest(`/${media_id}`, "GET", null, {
+      fields: fields.join(","),
+    });
+
+    return {
+      content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
+    };
   }
 );
 
 server.tool(
   "delete_media",
-  "Delete an Instagram post permanently. This action cannot be undone.",
+  "Delete an Instagram post permanently. This action cannot be undone. Returns confirmation of deletion.",
   {
-    media_id: z.string().describe("Instagram media ID to delete. Get IDs from list_media. Example: '17854360229135492'"),
+    media_id: z.string().describe("Instagram media ID to delete. Example: '17854360229135492'. Get IDs from list_media."),
   },
   async ({ media_id }) => {
     requireAuth();
     const result = await graphRequest(`/${media_id}`, "DELETE");
-    return jsonText({ success: true, deleted_media_id: media_id, result });
+
+    return {
+      content: [{ type: "text", text: JSON.stringify({ success: true, deleted_media_id: media_id, result }, null, 2) }],
+    };
   }
 );
 
 server.tool(
   "get_media_comments",
-  "Get comments on a specific Instagram post. Useful for community management and tracking engagement quality.",
+  "Get comments on a specific Instagram post. Useful for community management, responding to comments, or tracking engagement quality.",
   {
     media_id: z.string().describe("Instagram media ID. Example: '17854360229135492'"),
     limit: z.number().min(1).max(100).optional().default(20).describe("Number of comments to return"),
     after: z.string().optional().describe("Pagination cursor for next page of comments"),
-    fields: z.array(z.string()).optional().default(["id", "text", "timestamp", "username", "like_count"]).describe("Comment fields to return"),
+    fields: z.array(z.string()).optional().default(["id", "text", "timestamp", "username", "like_count", "replies"]).describe("Comment fields to return"),
   },
   async ({ media_id, limit, after, fields }) => {
     requireAuth();
-    const params: Record<string, unknown> = { fields: fields.join(","), limit };
+    const params = { fields: fields.join(","), limit };
     if (after) params.after = after;
 
     const data = await graphRequest(`/${media_id}/comments`, "GET", null, params);
-    return jsonText({ media_id, comments: data.data || [], count: (data.data as unknown[])?.length || 0, pagination: data.paging || null });
+
+    return {
+      content: [{ type: "text", text: JSON.stringify({
+        media_id,
+        comments: data.data || [],
+        count: (data.data || []).length,
+        pagination: data.paging || null,
+      }, null, 2) }],
+    };
   }
 );
 
@@ -491,7 +618,7 @@ server.tool(
 
 server.tool(
   "schedule_post",
-  "Schedule an Instagram photo or video post for a future time. The post will be automatically published at the specified timestamp. Must be 10 min to 75 days in the future.",
+  "Schedule an Instagram photo or video post for a future time. The post will be automatically published at the specified timestamp. Requires a Business or Creator account.",
   {
     image_url: z.string().url().optional().describe("Public URL of the image to post (use this OR video_url)"),
     video_url: z.string().url().optional().describe("Public URL of the video to post (use this OR image_url)"),
@@ -511,7 +638,7 @@ server.tool(
     if (publishTime < now + tenMinutes) throw new Error("Scheduled time must be at least 10 minutes in the future");
     if (publishTime > now + seventyFiveDays) throw new Error("Scheduled time cannot be more than 75 days in the future");
 
-    const body: Record<string, unknown> = {
+    const body = {
       caption: caption || "",
       published: false,
       scheduled_publish_time: publishTime,
@@ -523,12 +650,14 @@ server.tool(
 
     const container = await graphRequest(`/${INSTAGRAM_USER_ID}/media`, "POST", body);
 
-    return jsonText({
-      success: true,
-      container_id: container.id,
-      scheduled_for: scheduled_publish_time,
-      message: "Post scheduled successfully. It will be published automatically at the specified time.",
-    });
+    return {
+      content: [{ type: "text", text: JSON.stringify({
+        success: true,
+        container_id: container.id,
+        scheduled_for: scheduled_publish_time,
+        message: "Post scheduled successfully. It will be published automatically at the specified time.",
+      }, null, 2) }],
+    };
   }
 );
 
@@ -537,11 +666,13 @@ server.tool(
 const app = express();
 app.use(express.json());
 
-app.get("/health", (_req: Request, res: Response) => {
+// Health check
+app.get("/health", (req, res) => {
   res.json({ status: "ok", server: "instagram-complete", version: "1.0.0" });
 });
 
-app.post("/mcp", async (req: Request, res: Response) => {
+// MCP endpoint
+app.post("/mcp", async (req, res) => {
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => `ig-${Date.now()}-${Math.random().toString(36).slice(2)}`,
   });
@@ -550,6 +681,10 @@ app.post("/mcp", async (req: Request, res: Response) => {
 
   await server.connect(transport);
   await transport.handleRequest(req, res, req.body);
+});
+
+app.get("/mcp", async (req, res) => {
+  res.status(405).json({ error: "Method not allowed. Use POST for MCP requests." });
 });
 
 app.listen(PORT, () => {
