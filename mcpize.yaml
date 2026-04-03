@@ -1,0 +1,21 @@
+name: instagram-complete
+display_name: "Instagram Complete"
+description: "Complete Instagram MCP server. Publish content, manage stories, analyze performance, and track followers — all from your AI assistant."
+tagline: "Stop manually posting to Instagram."
+version: 1
+runtime: typescript
+env:
+  - name: INSTAGRAM_ACCESS_TOKEN
+    description: Instagram Graph API access token
+    required: true
+  - name: INSTAGRAM_USER_ID
+    description: Instagram User ID
+    required: true
+tags:
+  - instagram
+  - social-media
+  - content-publishing
+  - analytics
+  - automation
+  - reels
+  - stories
